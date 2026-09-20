@@ -17,6 +17,7 @@ Subcommands
   sni    Super-NaturalInstructions (~1600 tasks) — the diversity backbone.
          Streams task files from GitHub; no clone needed.
   hf     MNLI / ANLI / BoolQ / RACE / Yelp / SST-2 via `datasets`.
+  mix    Combine built files into one training set, soft labels winning.
   stats  Summarize a built file.
 
 Rows come out typed as TypeSafe primitives: yes/no label sets become `noul`
@@ -27,8 +28,10 @@ so run `teacher.py criteria` over its output to fill those in.
 Usage
   python build_data.py sni --out-dir data/ --max-per-task 40 --max-tasks 400
   python build_data.py hf  --out-dir data/ --sets mnli,boolq,race,yelp
+  python build_data.py mix --out data/train.jsonl \\
+      --sources data/sni.train.described.jsonl data/hf.train.jsonl \\
+                data/synth.labelled.jsonl --overlay data/real.labelled.jsonl
   python build_data.py stats --input data/train.jsonl
-  cat data/sni.train.jsonl data/hf.train.jsonl | shuf > data/train.jsonl
 """
 import argparse
 import hashlib
@@ -143,6 +146,16 @@ def write_splits(rows, out_dir, prefix, eval_frac, rng):
 
 # ----------------------------------------------- Super-NaturalInstructions
 
+def letter_labels(options):
+    """True when the labels are bare letters (A/B/C/D, (a), b. ...).
+
+    Those tasks keep their real choices inside the input text and use the
+    letter only as a pointer, so there is no option set to describe and the
+    letters collide with our own A/B/C lettering. Not a choice question.
+    """
+    return all(re.fullmatch(r"\(?[A-Za-z][.)]?", str(o).strip()) for o in options)
+
+
 def classification_options(instances, probe=400):
     """Decide whether a task is classification, and what its label set is.
 
@@ -183,6 +196,8 @@ def convert_sni_task(name, max_per_task, rng):
     options = classification_options(instances)
     if options is None:
         return name, None, "not classification"
+    if letter_labels(options):
+        return name, None, "letter labels"
 
     definition = norm(" ".join(data.get("Definition") or []))
     if not definition:
@@ -359,6 +374,98 @@ def cmd_hf(args):
     write_splits(rows, args.out_dir, "hf", args.eval_frac if len(wanted) > 2 else 0.0, rng)
 
 
+# -------------------------------------------------------------------- mix
+
+def cmd_mix(args):
+    """Combine built files into one training set, soft labels winning.
+
+    A row labelled by teacher.py carries the `_key` of the row it came from,
+    so the labelled sample lands back on top of its own source rows instead of
+    beside them — otherwise the same question trains twice, once calibrated
+    and once as a 0/1 target, and the hard copy undoes the soft one.
+    """
+    rng = random.Random(args.seed)
+
+    overlay = {}
+    for path in args.overlay or []:
+        for line in open(path):
+            if line.strip():
+                row = json.loads(line)
+                if row.get("_key"):
+                    overlay[row["_key"]] = row
+    if overlay:
+        print(f"{len(overlay)} labelled rows to overlay")
+
+    rows, replaced = [], 0
+    for path in args.sources:
+        n = 0
+        for i, line in enumerate(open(path)):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            key = row.get("_key") or f"{path}#{i}"
+            if key in overlay:
+                row = overlay.pop(key)
+                replaced += 1
+            rows.append(primitives.normalize(row))
+            n += 1
+        print(f"  {path}: {n} rows")
+    rows += list(overlay.values())     # labelled rows whose source isn't listed
+
+    if args.drop_flagged:
+        before = len(rows)
+        rows = [r for r in rows if not r.get("flags")]
+        print(f"dropped {before - len(rows)} flagged rows")
+
+    if args.max_per_task:
+        kept, seen_task = [], Counter()
+        for row in sorted(rows, key=lambda r: rng.random()):
+            task = row.get("task", "?")
+            if seen_task[task] < args.max_per_task:
+                seen_task[task] += 1
+                kept.append(row)
+        print(f"capped at {args.max_per_task}/task: {len(rows)} -> {len(kept)} rows")
+        rows = kept
+
+    held = []
+    if args.holdout:
+        # Group by STATE: every question about one state goes to the same side,
+        # or the eval set is answering questions about text it trained on.
+        by_state = defaultdict(list)
+        for row in rows:
+            by_state[row["state"]].append(row)
+        states = sorted(by_state)
+        rng.shuffle(states)
+        n_out = int(len(states) * args.holdout)
+        out_states = set(states[:n_out])
+        held = [r for s in out_states for r in by_state[s]]
+        rows = [r for r in rows if r["state"] not in out_states]
+        print(f"held out {len(held)} rows from {n_out} states")
+
+    seen, out = set(), []
+    for row in rows:
+        fp = fingerprint(row)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append(row)
+
+    rng.shuffle(out)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w") as f:
+        for row in out:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"\n{len(out)} rows ({replaced} replaced by labelled versions, "
+          f"{len(rows) - len(out)} duplicates dropped) -> {args.out}")
+
+    if held:
+        rng.shuffle(held)
+        with open(args.holdout_out, "w") as f:
+            for row in held:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"{len(held)} held-out rows -> {args.holdout_out}")
+
+
 # ------------------------------------------------------------------ stats
 
 def cmd_stats(args):
@@ -419,11 +526,26 @@ def main():
     h.add_argument("--sets", default="mnli,boolq,race,yelp,sst2")
     h.add_argument("--max-per-set", type=int, default=2000)
 
+    m = sub.add_parser("mix", help="combine built files into one training set")
+    m.add_argument("--sources", nargs="+", required=True)
+    m.add_argument("--overlay", nargs="*",
+                   help="labelled files that replace their source rows by _key")
+    m.add_argument("--out", required=True)
+    m.add_argument("--drop-flagged", action="store_true",
+                   help="drop rows teacher.py flagged ambiguous or gold-disagreeing")
+    m.add_argument("--max-per-task", type=int, default=0,
+                   help="cap rows per task so one big dataset can't dominate")
+    m.add_argument("--holdout", type=float, default=0.0,
+                   help="fraction of STATES to hold out (for sources split by state,"
+                        " like synth; task-split sources already have their own eval)")
+    m.add_argument("--holdout-out", default="holdout.jsonl")
+    m.add_argument("--seed", type=int, default=0)
+
     t = sub.add_parser("stats", help="summarize a built file")
     t.add_argument("--input", required=True)
 
     args = ap.parse_args()
-    {"sni": cmd_sni, "hf": cmd_hf, "stats": cmd_stats}[args.cmd](args)
+    {"sni": cmd_sni, "hf": cmd_hf, "mix": cmd_mix, "stats": cmd_stats}[args.cmd](args)
 
 
 if __name__ == "__main__":

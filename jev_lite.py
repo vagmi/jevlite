@@ -27,12 +27,17 @@ Data format (JSONL, one example per line)
 Usage
   pip install -U torch transformers peft bitsandbytes accelerate
   python jev_lite.py train --train train.jsonl --eval eval.jsonl --out adapter/
+  # with experiment tracking (pip install wandb; wandb login)
+  python jev_lite.py train --train train.jsonl --eval eval.jsonl --out adapter/ \
+      --wandb-project jev-lite --wandb-name gemma4-r16
   python jev_lite.py predict --adapter adapter/ --input questions.jsonl
 """
 import argparse
 import json
 import math
+import os
 import random
+from collections import Counter
 
 import torch
 import torch.nn.functional as F
@@ -143,13 +148,42 @@ def option_logprobs(model, enc, row, options=None):
 
 # ----------------------------------------------------------------------------- eval
 
+def summarize(records, bins=10):
+    """Mean metrics over a set of scored rows, plus calibration error."""
+    n = len(records)
+    if not n:
+        return {"n": 0}
+    out = {"n": n,
+           "acc": sum(r["hit"] for r in records) / n,
+           "nll": sum(r["nll"] for r in records) / n,
+           "brier": sum(r["brier"] for r in records) / n}
+
+    # Expected calibration error: does 80% confidence mean 80% accuracy?
+    ece = 0.0
+    for b in range(bins):
+        lo, hi = b / bins, (b + 1) / bins
+        group = [r for r in records
+                 if lo < r["conf"] <= hi or (b == 0 and r["conf"] == 0)]
+        if group:
+            acc = sum(r["hit"] for r in group) / len(group)
+            conf = sum(r["conf"] for r in group) / len(group)
+            ece += len(group) / n * abs(acc - conf)
+    out["ece"] = ece
+
+    # A score is served as an expected level, so its error is a distance, not
+    # a hit: predicting 3.9 when the truth is 4 is nearly right, and accuracy
+    # alone calls that a miss.
+    scores = [r for r in records if r["level_err"] is not None]
+    if scores:
+        out["score_mae"] = sum(r["level_err"] for r in scores) / len(scores)
+    return out
+
+
 @torch.no_grad()
 def evaluate(model, enc, rows, bins=10):
     was_training = model.training
     model.eval()
-    n = correct = 0
-    nll = brier = 0.0
-    confs, hits = [], []
+    records = []
     for ex in rows:
         try:
             lp = option_logprobs(model, enc, ex).cpu()
@@ -157,28 +191,104 @@ def evaluate(model, enc, rows, bins=10):
             continue
         t = target_dist(ex)
         p = lp.exp()
-        hit = float(p.argmax() == t.argmax())
-        n += 1
-        correct += hit
-        nll += -(t * lp).sum().item()
-        brier += ((p - t) ** 2).sum().item()
-        confs.append(p.max().item())
-        hits.append(hit)
-
-    # Expected calibration error: does 80% confidence mean 80% accuracy?
-    ece = 0.0
-    for b in range(bins):
-        lo, hi = b / bins, (b + 1) / bins
-        idx = [i for i, c in enumerate(confs) if lo < c <= hi or (b == 0 and c == 0)]
-        if idx:
-            acc = sum(hits[i] for i in idx) / len(idx)
-            conf = sum(confs[i] for i in idx) / len(idx)
-            ece += len(idx) / max(n, 1) * abs(acc - conf)
+        kind = primitives.kind_of(ex)
+        levels = torch.arange(len(t), dtype=torch.float32)
+        records.append({
+            "kind": kind,
+            "hit": float(p.argmax() == t.argmax()),
+            "nll": -(t * lp).sum().item(),
+            "brier": ((p - t) ** 2).sum().item(),
+            "conf": p.max().item(),
+            "level_err": (abs((p * levels).sum() - (t * levels).sum()).item()
+                          if kind == "score" else None),
+        })
 
     if was_training:
         model.train()
-    n = max(n, 1)
-    return {"n": n, "acc": correct / n, "nll": nll / n, "brier": brier / n, "ece": ece}
+
+    out = summarize(records, bins)
+    # Per primitive too: the three types fail in different ways, and an average
+    # over all of them hides which one regressed.
+    for kind in sorted({r["kind"] for r in records}):
+        for k, v in summarize([r for r in records if r["kind"] == kind], bins).items():
+            out[f"{kind}/{k}"] = v
+    return out
+
+
+# -------------------------------------------------------------------- tracking
+
+class Tracker:
+    """wandb when a project is named, a no-op otherwise.
+
+    One code path in train() either way: nothing here raises because tracking
+    is unavailable mid-run, since losing a metrics sink is no reason to lose
+    an hour of fine-tuning.
+    """
+
+    def __init__(self, args, train_rows, eval_rows):
+        self.run = None
+        project = args.wandb_project or os.environ.get("WANDB_PROJECT")
+        if not project:
+            return
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit("tracking needs wandb: pip install wandb "
+                             "(or drop --wandb-project)")
+        self.wandb = wandb
+        self.run = wandb.init(
+            project=project, name=args.wandb_name, entity=args.wandb_entity,
+            config={
+                "model": args.model, "lr": args.lr, "epochs": args.epochs,
+                "grad_accum": args.grad_accum, "lora_r": args.lora_r,
+                "max_len": args.max_len, "seed": args.seed, "attn": args.attn,
+                "shuffle_options": args.shuffle_options,
+                "train_file": args.train, "eval_file": args.eval,
+                "n_train": len(train_rows), "n_eval": len(eval_rows),
+                # The primitive mix is the thing most likely to explain a run
+                # looking different from the last one, so it travels with it.
+                "train_mix": dict(Counter(primitives.kind_of(r) for r in train_rows)),
+                "eval_mix": dict(Counter(primitives.kind_of(r) for r in eval_rows)),
+                "train_soft_frac": (sum(1 for r in train_rows if "label" in r)
+                                    / max(len(train_rows), 1)),
+                "train_criteria_frac": (sum(1 for r in train_rows if r.get("criteria"))
+                                        / max(len(train_rows), 1)),
+            })
+
+    def use_dataset(self, name):
+        """Record which dataset version trained this run, in wandb's lineage."""
+        if not self.run or not name:
+            return
+        try:
+            self.run.use_artifact(name)
+            print(f"  run linked to dataset artifact {name}")
+        except Exception as e:
+            print(f"  (could not link {name}: {type(e).__name__}: {e})")
+
+    def log(self, metrics, step=None, prefix=""):
+        if not self.run:
+            return
+        payload = {f"{prefix}{k}": v for k, v in metrics.items()
+                   if isinstance(v, (int, float))}
+        try:
+            self.run.log(payload, step=step)
+        except Exception as e:                      # never kill a run over telemetry
+            print(f"  (wandb log failed: {type(e).__name__}: {e})")
+
+    def finish(self, adapter_dir=None, final=None):
+        if not self.run:
+            return
+        try:
+            if final:
+                self.run.summary.update({f"final/{k}": v for k, v in final.items()
+                                         if isinstance(v, (int, float))})
+            if adapter_dir:
+                art = self.wandb.Artifact(f"{self.run.name}-adapter", type="lora-adapter")
+                art.add_dir(adapter_dir)
+                self.run.log_artifact(art)
+            self.run.finish()
+        except Exception as e:
+            print(f"  (wandb finish failed: {type(e).__name__}: {e})")
 
 
 # ---------------------------------------------------------------------------- train
@@ -196,6 +306,8 @@ def train(args):
     # file built before either existed still trains as the API will serve it.
     train_rows = [primitives.normalize(r) for r in load_jsonl(args.train)]
     eval_rows = [primitives.normalize(r) for r in load_jsonl(args.eval)] if args.eval else []
+    track = Tracker(args, train_rows, eval_rows)
+    track.use_dataset(args.wandb_dataset)
 
     model = load_base(args.model, args.attn)
     model = prepare_model_for_kbit_training(
@@ -231,11 +343,19 @@ def train(args):
         opt.zero_grad(set_to_none=True)
         step += 1
         if step % args.log_every == 0:
-            print(f"step {step}/{total_steps}  loss {running / args.log_every:.4f}  "
-                  f"lr {sched.get_last_lr()[0]:.2e}", flush=True)
+            lr = sched.get_last_lr()[0]
+            loss = running / args.log_every
+            print(f"step {step}/{total_steps}  loss {loss:.4f}  lr {lr:.2e}", flush=True)
+            # micro counts rows seen across all epochs, so this reads as
+            # "epochs elapsed" and stays monotonic past the first one.
+            track.log({"loss": loss, "lr": lr,
+                       "epoch": micro / max(len(train_rows), 1)},
+                      step=step, prefix="train/")
             running = 0.0
         if eval_rows and step % args.eval_every == 0:
-            print(f"  eval @ {step}: {evaluate(model, enc, eval_rows)}", flush=True)
+            metrics = evaluate(model, enc, eval_rows)
+            print(f"  eval @ {step}: {metrics}", flush=True)
+            track.log(metrics, step=step, prefix="eval/")
 
     for epoch in range(args.epochs):
         rng.shuffle(train_rows)
@@ -259,11 +379,13 @@ def train(args):
     if micro % args.grad_accum:
         optimizer_step()
 
-    if eval_rows:
-        print(f"final eval: {evaluate(model, enc, eval_rows)}")
+    final = evaluate(model, enc, eval_rows) if eval_rows else None
+    if final:
+        print(f"final eval: {final}")
     model.save_pretrained(args.out)
     tok.save_pretrained(args.out)
     print(f"saved adapter to {args.out}")
+    track.finish(args.out if args.wandb_artifact else None, final)
 
 
 # -------------------------------------------------------------------------- predict
@@ -313,6 +435,14 @@ def main():
     t.add_argument("--log-every", type=int, default=10)
     t.add_argument("--eval-every", type=int, default=200)
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--wandb-project", help="log to this wandb project "
+                                           "(or set WANDB_PROJECT); off by default")
+    t.add_argument("--wandb-name", help="run name; wandb invents one if omitted")
+    t.add_argument("--wandb-entity", help="team or user the run belongs to")
+    t.add_argument("--wandb-artifact", action="store_true",
+                   help="upload the trained adapter to the run")
+    t.add_argument("--wandb-dataset", metavar="NAME:VERSION",
+                   help="link an existing dataset artifact, e.g. jev-data:v0")
 
     p = sub.add_parser("predict")
     common(p)

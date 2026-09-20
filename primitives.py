@@ -139,24 +139,65 @@ def build_prompt(row, options=None):
 
 # ------------------------------------------------------------------ answers
 
+def confidence(kind, probs, score=None):
+    """The model's probability that the answer it just gave is the right one.
+
+    One rule, realized per type, because each type returns a different thing:
+    a choice returns its argmax, so confidence is that option's probability; a
+    score returns an expected level, so it is the mass that rounds to the level
+    reported. Both are directly readable — 0.8 means wrong one time in five —
+    which is what makes a threshold an error budget instead of a vibe.
+
+    Chosen by measurement, not taste: over 1898 held-out rows these beat
+    entropy, margin, chance-corrected top and collision entropy on both AUROC
+    (ranking right answers above wrong ones) and ECE (the number meaning what
+    it says). Normalized entropy, the obvious first guess, was the worst of the
+    lot — it is dominated by small probabilities, so it reads a decisive
+    0.85/0.08/0.07 as barely-there confidence and sends good answers to review.
+    """
+    if kind == "score":
+        return sum(p for i, p in enumerate(probs) if abs(i - score) <= 0.5)
+    return max(probs)
+
+
 def answer(row, probs):
     """Shape a probability distribution into the API's answer for this type."""
     kind = kind_of(row)
     options = row["options"]
+    # A noul carries no confidence field: the probability IS the answer, and
+    # the caller thresholds it directly.
     if kind == "noul":
         return {"type": "noul", "noul": round(probs[0], 4)}
 
-    confidence = round(1.0 - normalized_entropy(probs), 4)
     if kind == "score":
+        expected = sum(i * p for i, p in enumerate(probs))
         return {"type": "score",
-                "score": round(sum(i * p for i, p in enumerate(probs)), 4),
+                "score": round(expected, 4),
                 "legend": {str(i): o for i, o in enumerate(options)},
                 "probabilities": {str(i): round(p, 4) for i, p in enumerate(probs)},
-                "confidence": confidence}
+                "confidence": round(confidence(kind, probs, expected), 4)}
     return {"type": "choice",
             "choice": options[max(range(len(probs)), key=probs.__getitem__)],
             "probabilities": {o: round(p, 4) for o, p in zip(options, probs)},
-            "confidence": confidence}
+            "confidence": round(confidence(kind, probs), 4)}
+
+
+def temper(probs, temperature):
+    """Flatten (T>1) or sharpen (T<1) a distribution, leaving the argmax alone.
+
+    Serving-time calibration: an adapter trained against one numeric precision
+    and served at another produces a distribution of the wrong sharpness. The
+    ranking is unaffected, so accuracy does not move — only how confident the
+    answer claims to be, which is the part that gates actions.
+    """
+    import math
+    if temperature == 1.0:
+        return list(probs)
+    logs = [math.log(max(p, 1e-12)) / temperature for p in probs]
+    top = max(logs)
+    exp = [math.exp(x - top) for x in logs]
+    total = sum(exp)
+    return [x / total for x in exp]
 
 
 def normalized_entropy(probs):
