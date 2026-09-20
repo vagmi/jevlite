@@ -30,7 +30,8 @@ find out:
 Runs in the vLLM venv, which pins its own torch:
 
   uv venv --python 3.12 .venv-vllm && uv pip install --python .venv-vllm/bin/python vllm
-  .venv-vllm/bin/python serve_vllm.py --adapter jev-lite-adapter
+  .venv-vllm/bin/python serve_vllm.py                             # from the Hub
+  .venv-vllm/bin/python serve_vllm.py --adapter jev-lite-adapter  # or local
 
 Auth: set JEV_API_KEY to require `Authorization: Bearer <key>`, same as serve.py.
 
@@ -52,7 +53,7 @@ import uvicorn
 from transformers import AutoTokenizer
 
 import primitives
-from api import create_app
+from api import create_app, resolve_adapter
 
 # Fitted on half the held-out rows, measured on the other half. See the module
 # docstring; this is a property of serving a QLoRA adapter on a bf16 base, not
@@ -71,9 +72,11 @@ class VllmBackend:
         from vllm.lora.request import LoRARequest
 
         self.temperature = temperature
+        # vLLM's LoRARequest needs a real directory, so a Hub id is fetched first.
+        adapter = os.path.abspath(resolve_adapter(adapter))
         self.tok = AutoTokenizer.from_pretrained(adapter)
         self.letter_ids = [self._letter_id(c) for c in primitives.LETTERS]
-        self.lora = LoRARequest("jev", 1, os.path.abspath(adapter))
+        self.lora = LoRARequest("jev", 1, adapter)
 
         print(f"loading {base} + {adapter} under vLLM ...", flush=True)
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
@@ -132,7 +135,8 @@ class VllmBackend:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--adapter", default="jev-lite-adapter")
+    ap.add_argument("--adapter", default="vagmi/jev-lite",
+                    help="Hub id or local directory")
     ap.add_argument("--model", default="google/gemma-4-E4B-it")
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--gpu-fraction", type=float, default=0.88)

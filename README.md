@@ -23,9 +23,14 @@ Both servers speak the TypeSafe wire API (`POST /v1/systemone`, `GET /v1/models`
 their contract via `api.py`, so the official SDK drives either one unmodified.
 
 ```bash
-python serve.py --adapter jev-lite-adapter                      # torch, 4-bit
-.venv-vllm/bin/python serve_vllm.py --adapter jev-lite-adapter  # vLLM, bf16
+python serve.py                        # torch 4-bit, pulls vagmi/jev-lite from the Hub
+.venv-vllm/bin/python serve_vllm.py    # vLLM bf16, same adapter
+
+python serve.py --adapter jev-lite-adapter   # or point at a local training output
 ```
+
+Both take `--adapter` as a Hub id or a local directory; the default is the published
+adapter, so a fresh checkout serves without training anything first.
 
 ```python
 from typesafe_sdk import TypeSafeClient, Choice, Score, Noul

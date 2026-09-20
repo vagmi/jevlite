@@ -26,8 +26,9 @@ for roughly 3x the throughput and a fitted temperature — see its docstring.
 
 Usage
   pip install fastapi uvicorn
-  python serve.py --adapter jev-lite-adapter
-  python serve.py --adapter jev-lite-adapter --host 0.0.0.0 --port 8000
+  python serve.py                                   # vagmi/jev-lite from the Hub
+  python serve.py --adapter jev-lite-adapter        # or a local training output
+  python serve.py --host 0.0.0.0 --port 8000
 
 Auth: set JEV_API_KEY to require `Authorization: Bearer <key>`. Unset, the
 server accepts any caller — fine on localhost, not on a network.
@@ -41,7 +42,7 @@ import uvicorn
 from starlette.concurrency import run_in_threadpool
 
 import primitives
-from api import create_app
+from api import create_app, resolve_adapter
 from jev_lite import Encoder, load_base, option_logprobs
 
 
@@ -54,6 +55,7 @@ class TorchBackend:
         from peft import PeftModel
         from transformers import AutoTokenizer
 
+        adapter = resolve_adapter(adapter)
         print(f"loading {base_model} + {adapter} ...", flush=True)
         tok = AutoTokenizer.from_pretrained(adapter)
         self.enc = Encoder(tok, max_len)
@@ -84,7 +86,8 @@ class TorchBackend:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--adapter", default="jev-lite-adapter")
+    ap.add_argument("--adapter", default="vagmi/jev-lite",
+                    help="Hub id or local directory")
     ap.add_argument("--model", default="google/gemma-4-E4B-it")
     ap.add_argument("--max-len", type=int, default=8192)
     ap.add_argument("--attn", default="sdpa")

@@ -14,7 +14,8 @@ A backend is any object with:
     async answer(rows) -> (answers, input_token_count)
 
 where `rows` are normalized primitives.py rows and each answer is whatever
-primitives.answer() produced for it.
+primitives.answer() produced for it. resolve_adapter() lives here too, since
+both backends need the same answer to "where are the weights".
 """
 import json
 import os
@@ -42,6 +43,26 @@ MODELS = [
      "release_date": "2026-09-19"},
 ]
 MODEL_NAMES = {m["name"] for m in MODELS}
+
+
+ADAPTER_FILES = ["adapter_config.json", "adapter_model.safetensors",
+                 "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
+
+
+def resolve_adapter(ref: str) -> str:
+    """A local directory, or a Hub id to fetch — always returns a local path.
+
+    peft resolves Hub ids itself, but vLLM's LoRARequest wants a real directory,
+    so both go through this and get the same thing.
+    """
+    if os.path.isdir(ref):
+        return ref
+    from huggingface_hub import snapshot_download
+
+    print(f"fetching adapter {ref} from the Hub ...", flush=True)
+    path = snapshot_download(ref, allow_patterns=ADAPTER_FILES)
+    print(f"  -> {path}", flush=True)
+    return path
 
 
 # ------------------------------------------------------------------ schema
